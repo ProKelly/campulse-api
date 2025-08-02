@@ -1,0 +1,41 @@
+from typing import Dict, Any, Type
+from google.cloud.firestore import GeoPoint
+from app.models.base import DocumentInDB
+from datetime import datetime
+
+def convert_doc_to_model(doc_id: str, doc_data: Dict[str, Any], Model: Type) -> Any:
+    print("Converting document to model:", doc_id, doc_data)  # Debugging log
+    try:
+        # Ensure all datetime fields are serialized to strings
+        for key, value in doc_data.items():
+            if isinstance(value, datetime):
+                doc_data[key] = value.isoformat()
+            elif isinstance(value, GeoPoint):
+                # Convert GeoPoint to dictionary
+                doc_data[key] = {"_latitude": value.latitude, "_longitude": value.longitude}
+            elif isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, datetime):
+                        value[sub_key] = sub_value.isoformat()
+                    elif isinstance(sub_value, GeoPoint):
+                        value[sub_key] = {"_latitude": sub_value.latitude, "_longitude": sub_value.longitude}
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    if isinstance(item, dict):
+                        for sub_key, sub_value in item.items():
+                            if isinstance(sub_value, datetime):
+                                item[sub_key] = sub_value.isoformat()
+                            elif isinstance(sub_value, GeoPoint):
+                                item[sub_key] = {"_latitude": sub_value.latitude, "_longitude": sub_value.longitude}
+
+        # Handle Firestore sentinel values (e.g., SERVER_TIMESTAMP)
+        for key, value in doc_data.items():
+            if str(value).startswith("Sentinel"):  # Check for sentinel values
+                doc_data[key] = "SERVER_TIMESTAMP"  # Replace with a string for serialization
+
+        data = {"id": doc_id, **doc_data}
+        data = DocumentInDB.convert_timestamp_to_datetime(data)
+        return Model.model_validate(data)
+    except Exception as e:
+        print("Error in convert_doc_to_model:", e)  # Debugging log
+        raise

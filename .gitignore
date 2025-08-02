@@ -1,0 +1,11 @@
+venv
+.env
+serviceAccountKey.json
+__pycache__
+*.pyc
+.vscode
+.history
+.idea
+*.log
+
+
