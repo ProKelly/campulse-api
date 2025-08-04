@@ -12,7 +12,11 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # replace with frontend domain
+    allow_origins=[
+        "https://dsmartcity.site"
+        "https://www.dsmartcity.site",
+        "http://localhost:5173",
+        ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
