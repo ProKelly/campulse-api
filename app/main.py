@@ -13,7 +13,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://dsmartcity.site"
+        "https://dsmartcity.site",
         "https://www.dsmartcity.site",
         "http://localhost:5173",
         ],
