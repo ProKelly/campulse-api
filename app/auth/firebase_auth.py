@@ -3,6 +3,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from firebase_admin import auth
 from app.config import db
+from google.auth.exceptions import TransportError
+
 
 oauth2_scheme = HTTPBearer(auto_error=False)
 
@@ -18,12 +20,41 @@ async def get_current_user_id(token: HTTPAuthorizationCredentials = Depends(oaut
         )
 
     try:
+        print(f"Verifying token: {token.credentials[:50]}...")
         decoded_token = auth.verify_id_token(token.credentials)
         uid = decoded_token["uid"]
+        print(f"Successfully verified token for UID: {uid}")
         return uid
+    
+    
+    except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+    except auth.ExpiredIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expired"
+        )
+    except auth.RevokedIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token revoked"
+        )
+    except auth.InvalidIdTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+    except TransportError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not verify token (network error)"
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid authentication token: {e}",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Could not validate credentials"
         )
+    

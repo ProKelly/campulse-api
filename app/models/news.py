@@ -30,3 +30,14 @@ from app.models.base import DocumentInDB
 
 class NewsInDB(DocumentInDB, NewsCreate):
     timestamp: Optional[datetime] = None
+
+# News from api sources
+class NewsItem(BaseModel):
+    id: Optional[str]
+    title: str
+    description: Optional[str]
+    url: Optional[str]
+    source: Optional[str]
+    image: Optional[str]
+    time: Optional[str]
+    type_of_post: Optional[str]

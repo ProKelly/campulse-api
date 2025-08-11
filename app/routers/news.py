@@ -1,23 +1,28 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from typing import List
-from app.models.news import NewsCreate, NewsUpdate, NewsInDB
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import List, Optional
+from starlette.concurrency import run_in_threadpool
+import asyncio
+from dateutil.parser import parse
+from app.models.news import NewsCreate, NewsUpdate, NewsInDB, NewsItem
 from app.auth.firebase_auth import get_current_user_id
 from app.config import db
 from app.db.utils import convert_doc_to_model
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
+from app.core.websearch import fetch_newsapi_news, fetch_serpapi_news, fetch_serper_news
 
 router = APIRouter(prefix="/news", tags=["News"])
 
+# Firestore CRUD endpoints
 @router.post("/", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
 async def create_news(news: NewsCreate, current_user_id: str = Depends(get_current_user_id)):
     if db is None:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
+    news_data = news.model_dump()
+    news_data['timestamp'] = SERVER_TIMESTAMP
     try:
-        news_data = news.model_dump()
-        news_data['timestamp'] = SERVER_TIMESTAMP
         doc_ref = db.collection("news").document()
-        await doc_ref.set(news_data)
-        created_doc = await doc_ref.get()
+        await run_in_threadpool(doc_ref.set, news_data)
+        created_doc = await run_in_threadpool(doc_ref.get)
         return convert_doc_to_model(created_doc.id, created_doc.to_dict(), NewsInDB)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create news: {e}")
@@ -28,8 +33,8 @@ async def get_all_news():
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         news_entries = []
-        docs = db.collection("news").stream()
-        async for doc in docs:
+        docs = await run_in_threadpool(lambda: list(db.collection("news").stream()))
+        for doc in docs:
             news_entries.append(convert_doc_to_model(doc.id, doc.to_dict(), NewsInDB))
         return news_entries
     except Exception as e:
@@ -41,12 +46,12 @@ async def get_news(news_id: str):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         news_ref = db.collection("news").document(news_id)
-        doc = await news_ref.get()
+        doc = await run_in_threadpool(news_ref.get)
         if not doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="News entry not found")
         return convert_doc_to_model(doc.id, doc.to_dict(), NewsInDB)
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve news: {e}")
 
@@ -56,14 +61,15 @@ async def update_news(news_id: str, news: NewsUpdate, current_user_id: str = Dep
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         news_ref = db.collection("news").document(news_id)
-        if not (await news_ref.get()).exists:
+        doc = await run_in_threadpool(news_ref.get)
+        if not doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="News entry not found")
         update_data = news.model_dump(exclude_unset=True)
-        await news_ref.update(update_data)
-        updated_doc = await news_ref.get()
+        await run_in_threadpool(news_ref.update, update_data)
+        updated_doc = await run_in_threadpool(news_ref.get)
         return convert_doc_to_model(updated_doc.id, updated_doc.to_dict(), NewsInDB)
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update news: {e}")
 
@@ -73,11 +79,68 @@ async def delete_news(news_id: str, current_user_id: str = Depends(get_current_u
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         news_ref = db.collection("news").document(news_id)
-        if not (await news_ref.get()).exists:
+        doc = await run_in_threadpool(news_ref.get)
+        if not doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="News entry not found")
-        await news_ref.delete()
+        await run_in_threadpool(news_ref.delete)
         return {"message": "News entry deleted successfully"}
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete news: {e}")
+
+# External news search endpoint
+@router.get("/search", response_model=List[NewsItem])
+async def search_news(
+    q: Optional[str] = Query("", description="Search query"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=50),
+    source: Optional[str] = Query(None, description="Source filter: 'newsapi', 'serpapi', 'serper' or None for all"),
+):
+    tasks = []
+    results = []
+
+    query = q or "Cameroon"
+
+    if source in [None, "newsapi"]:
+        tasks.append(fetch_newsapi_news(query=query, page=page, page_size=page_size))
+    if source in [None, "serpapi"]:
+        tasks.append(fetch_serpapi_news(query=query, num=page_size))
+    if source in [None, "serper"]:
+        tasks.append(fetch_serper_news(query=query, num=page_size))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="Invalid source parameter")
+
+    fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for result in fetched_results:
+        if isinstance(result, Exception):
+            # Optionally log the error here
+            continue
+        results.extend(result)
+
+    # Deduplicate by URL or title
+    seen = set()
+    unique_results = []
+    for item in results:
+        identifier = item.url or item.title
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            unique_results.append(item)
+
+    # Sort by time descending (newest first)
+    def parse_time(t):
+        try:
+            return parse(t)
+        except Exception:
+            return None
+
+    unique_results.sort(key=lambda x: parse_time(x.time) or 0, reverse=True)
+
+    # Paginate combined results
+    start = (page - 1) * page_size
+    end = start + page_size
+    paginated = unique_results[start:end]
+
+    return paginated

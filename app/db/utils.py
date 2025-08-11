@@ -2,6 +2,7 @@ from typing import Dict, Any, Type
 from google.cloud.firestore import GeoPoint
 from app.models.base import DocumentInDB
 from datetime import datetime
+import math
 
 def convert_doc_to_model(doc_id: str, doc_data: Dict[str, Any], Model: Type) -> Any:
     print("Converting document to model:", doc_id, doc_data)  # Debugging log
@@ -39,3 +40,19 @@ def convert_doc_to_model(doc_id: str, doc_data: Dict[str, Any], Model: Type) -> 
     except Exception as e:
         print("Error in convert_doc_to_model:", e)  # Debugging log
         raise
+
+
+def bounding_box(lat, lon, radius):
+    """
+    Returns the bounding box coordinates for a given lat/lon and radius in meters.
+    """
+    R = 6378137.0  # Earth radius in meters
+    d_lat = radius / R
+    d_lon = radius / (R * math.cos(math.pi * lat / 180))
+
+    min_lat = lat - d_lat * 180 / math.pi
+    max_lat = lat + d_lat * 180 / math.pi
+    min_lon = lon - d_lon * 180 / math.pi
+    max_lon = lon + d_lon * 180 / math.pi
+
+    return (min_lat, min_lon, max_lat, max_lon)
