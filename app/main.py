@@ -5,7 +5,7 @@ from app.routers import user, poi, institution, post, news
 
 app = FastAPI(
     title="Campulse Backend",
-    description="FastAPI + Firestore backend for Campulse",
+    description="API backend for Campulse #dsmartcity",
     version="1.0.0",
 )
 
@@ -33,4 +33,4 @@ app.include_router(news.router)
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to Campulse API"}
+    return {"message": "Welcome to Campulse API, Explore your city's opportunities"}
