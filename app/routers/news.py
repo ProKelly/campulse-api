@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import List, Optional
 import asyncio
+from datetime import datetime
 from dateutil.parser import parse
 from app.models.news import NewsCreate, NewsUpdate, NewsInDB, NewsItem
 from app.auth.firebase_auth import get_current_user_id
@@ -12,7 +13,7 @@ from app.core.websearch import fetch_newsapi_news, fetch_serpapi_news, fetch_ser
 router = APIRouter(prefix="/news", tags=["News"])
 
 
-# Firestore CRUD endpoints
+# Firestore CRUD endpoints (unchanged, assuming they work)
 @router.post("/", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
 async def create_news(news: NewsCreate, current_user_id: str = Depends(get_current_user_id)):
     if db is None:
@@ -27,7 +28,6 @@ async def create_news(news: NewsCreate, current_user_id: str = Depends(get_curre
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create news: {e}")
 
-
 @router.get("/", response_model=List[NewsInDB])
 async def get_all_news():
     if db is None:
@@ -40,7 +40,113 @@ async def get_all_news():
         return news_entries
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve news: {e}")
+    
 
+
+@router.get("/search", response_model=List[NewsItem])
+async def search_news(
+    q: Optional[str] = Query("", description="Search query"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=50),
+    source: Optional[str] = Query(None, description="Source filter: 'newsapi', 'serpapi', 'serper' or None for all"),
+):
+    tasks = []
+    results = []
+
+    query = q or "Cameroon"
+
+    # Schedule API tasks based on source filter
+    if source in [None, "newsapi"]:
+        tasks.append(fetch_newsapi_news(query=query, page=page, page_size=page_size))
+    if source in [None, "serpapi"]:
+        tasks.append(fetch_serpapi_news(query=query, num=page_size))
+    if source in [None, "serper"]:
+        tasks.append(fetch_serper_news(query=query, num=page_size))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="Invalid source parameter")
+
+    # Fetch results concurrently
+    fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Process results, filtering out exceptions
+    for result in fetched_results:
+        if isinstance(result, Exception):
+            print(f"Warning: External API fetch failed: {result}")
+            continue
+        if isinstance(result, list):
+            results.extend(result)
+        else:
+            print(f"Warning: Unexpected result type from API: {type(result)}")
+
+    # Deduplicate external results
+    seen = set()
+    unique_results = []
+    for item in results:
+        identifier = item.url or item.title
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            unique_results.append(item)
+
+    # Fetch and filter DB news
+    db_news = []
+    if db is None:
+        print("Warning: Firestore not initialized")
+    else:
+        try:
+            docs = db.collection("news").stream()  # Synchronous fetch
+            for doc in docs:
+                data = doc.to_dict()
+                db_item_dict = {
+                    "id": doc.id,
+                    "title": data.get("headline") or "Untitled",
+                    "description": data.get("summary"),
+                    "time": data.get("timestamp").isoformat() if data.get("timestamp") else "",
+                    "source": data.get("source", "Local DB"),
+                    "image": data.get("article_url"),  # Adjust if you have a dedicated image field
+                    "url": data.get("article_url"),
+                    "type_of_post": data.get("topic") or "news",
+                }
+                matches_query = (
+                    query.lower() in (data.get('headline', '').lower()) or
+                    query.lower() in (data.get('summary', '').lower())
+                )
+                if query == "Cameroon" or matches_query:
+                    try:
+                        db_news.append(NewsItem(**db_item_dict))
+                    except Exception as e:
+                        print(f"Warning: Failed to create NewsItem for DB entry {doc.id}: {e}")
+        except Exception as e:
+            print(f"Warning: Failed to fetch DB news: {e}")
+
+    # Merge DB news with external results
+    all_results = db_news + unique_results
+
+    # Deduplicate merged results
+    seen = set()
+    unique_all = []
+    for item in all_results:
+        identifier = item.url or item.title
+        if identifier and identifier not in seen:
+            seen.add(identifier)
+            unique_all.append(item)
+
+    # Sort by time
+    def parse_time(t):
+        try:
+            return parse(t) if t else datetime.min
+        except Exception:
+            return datetime.min
+
+    unique_all.sort(key=lambda x: parse_time(x.time), reverse=True)
+
+    # Paginate results
+    start = (page - 1) * page_size
+    end = start + page_size
+    paginated_results = unique_all[start:end]
+    
+    print(f"Returning {len(paginated_results)} news items (Total: {len(unique_all)}, Page: {page}, Page Size: {page_size})")
+    return paginated_results
 
 @router.get("/{news_id}", response_model=NewsInDB)
 async def get_news(news_id: str):
@@ -56,7 +162,6 @@ async def get_news(news_id: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve news: {e}")
-
 
 @router.put("/{news_id}", response_model=NewsInDB)
 async def update_news(news_id: str, news: NewsUpdate, current_user_id: str = Depends(get_current_user_id)):
@@ -76,7 +181,6 @@ async def update_news(news_id: str, news: NewsUpdate, current_user_id: str = Dep
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update news: {e}")
 
-
 @router.delete("/{news_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_news(news_id: str, current_user_id: str = Depends(get_current_user_id)):
     if db is None:
@@ -92,54 +196,3 @@ async def delete_news(news_id: str, current_user_id: str = Depends(get_current_u
         raise
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete news: {e}")
-
-
-# External news search endpoint
-@router.get("/search", response_model=List[NewsItem])
-async def search_news(
-    q: Optional[str] = Query("", description="Search query"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=50),
-    source: Optional[str] = Query(None, description="Source filter: 'newsapi', 'serpapi', 'serper' or None for all"),
-):
-    tasks = []
-    results = []
-
-    query = q or "Cameroon"
-
-    if source in [None, "newsapi"]:
-        tasks.append(fetch_newsapi_news(query=query, page=page, page_size=page_size))
-    if source in [None, "serpapi"]:
-        tasks.append(fetch_serpapi_news(query=query, num=page_size))
-    if source in [None, "serper"]:
-        tasks.append(fetch_serper_news(query=query, num=page_size))
-
-    if not tasks:
-        raise HTTPException(status_code=400, detail="Invalid source parameter")
-
-    fetched_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for result in fetched_results:
-        if isinstance(result, Exception):
-            continue
-        results.extend(result)
-
-    seen = set()
-    unique_results = []
-    for item in results:
-        identifier = item.url or item.title
-        if identifier and identifier not in seen:
-            seen.add(identifier)
-            unique_results.append(item)
-
-    def parse_time(t):
-        try:
-            return parse(t)
-        except Exception:
-            return None
-
-    unique_results.sort(key=lambda x: parse_time(x.time) or 0, reverse=True)
-
-    start = (page - 1) * page_size
-    end = start + page_size
-    return unique_results[start:end]
