@@ -5,7 +5,6 @@ from datetime import datetime
 import math
 
 def convert_doc_to_model(doc_id: str, doc_data: Dict[str, Any], Model: Type) -> Any:
-    print("Converting document to model:", doc_id, doc_data)  # Debugging log
     try:
         # Ensure all datetime fields are serialized to strings
         for key, value in doc_data.items():

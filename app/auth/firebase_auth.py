@@ -20,10 +20,8 @@ async def get_current_user_id(token: HTTPAuthorizationCredentials = Depends(oaut
         )
 
     try:
-        print(f"Verifying token: {token.credentials[:50]}...")
         decoded_token = auth.verify_id_token(token.credentials)
         uid = decoded_token["uid"]
-        print(f"Successfully verified token for UID: {uid}")
         return uid
     
     

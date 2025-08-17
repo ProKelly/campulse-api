@@ -25,7 +25,6 @@ async def create_institution(institution: InstitutionCreate, current_user_id: st
     if institution.owner_id != current_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only create institutions owned by yourself.")
     try:
-        print("Received payload: %s", institution.dict())
         institution_data = institution.model_dump(by_alias=True)
         institution_data['location'] = institution.location.to_firestore_geopoint()
         institution_data['created_at'] = SERVER_TIMESTAMP
