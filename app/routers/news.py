@@ -12,37 +12,6 @@ from app.core.websearch import fetch_newsapi_news, fetch_serpapi_news, fetch_ser
 
 router = APIRouter(prefix="/news", tags=["News"])
 
-
-# Firestore CRUD endpoints (unchanged, assuming they work)
-@router.post("/", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
-async def create_news(news: NewsCreate, current_user_id: str = Depends(get_current_user_id)):
-    if db is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
-    news_data = news.model_dump()
-    news_data['timestamp'] = SERVER_TIMESTAMP
-    try:
-        doc_ref = db.collection("news").document()
-        doc_ref.set(news_data)  # synchronous
-        created_doc = doc_ref.get()  # synchronous
-        return convert_doc_to_model(created_doc.id, created_doc.to_dict(), NewsInDB)
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create news: {e}")
-
-@router.get("/", response_model=List[NewsInDB])
-async def get_all_news():
-    if db is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
-    try:
-        news_entries = []
-        docs = db.collection("news").stream()  # synchronous
-        for doc in docs:
-            news_entries.append(convert_doc_to_model(doc.id, doc.to_dict(), NewsInDB))
-        return news_entries
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve news: {e}")
-    
-
-
 @router.get("/search", response_model=List[NewsItem])
 async def search_news(
     q: Optional[str] = Query("", description="Search query"),
@@ -147,6 +116,34 @@ async def search_news(
     
     print(f"Returning {len(paginated_results)} news items (Total: {len(unique_all)}, Page: {page}, Page Size: {page_size})")
     return paginated_results
+
+# Firestore CRUD endpoints (unchanged, assuming they work)
+@router.post("/", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
+async def create_news(news: NewsCreate, current_user_id: str = Depends(get_current_user_id)):
+    if db is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
+    news_data = news.model_dump()
+    news_data['timestamp'] = SERVER_TIMESTAMP
+    try:
+        doc_ref = db.collection("news").document()
+        doc_ref.set(news_data)  # synchronous
+        created_doc = doc_ref.get()  # synchronous
+        return convert_doc_to_model(created_doc.id, created_doc.to_dict(), NewsInDB)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create news: {e}")
+
+@router.get("/", response_model=List[NewsInDB])
+async def get_all_news():
+    if db is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
+    try:
+        news_entries = []
+        docs = db.collection("news").stream()  # synchronous
+        for doc in docs:
+            news_entries.append(convert_doc_to_model(doc.id, doc.to_dict(), NewsInDB))
+        return news_entries
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to retrieve news: {e}")
 
 @router.get("/{news_id}", response_model=NewsInDB)
 async def get_news(news_id: str):

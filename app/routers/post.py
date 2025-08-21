@@ -9,6 +9,8 @@ from app.db.utils import convert_doc_to_model, bounding_box
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 import logging
 import geohash2
+import ollama  # New import for Ollama
+import json
 
 router = APIRouter(prefix="/institution_posts", tags=["Institution Posts"])
 logger = logging.getLogger(__name__)
@@ -29,6 +31,108 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
     return R * c
 
+
+@router.get("/ai-search", response_model=List[InstitutionPostInDB])
+async def ai_search_posts(
+    search_query: str,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    radius: int = 5000
+):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Firestore not initialized.")
+
+    try:
+        # --- Step 1. Use Ollama to extract search params ---
+        prompt = f"""Analyze the user's natural language search query and extract parameters for filtering posts.
+
+Query: {search_query}
+
+Output ONLY the JSON object, nothing else:
+{{
+  "post_types": list of strings like ["job", "internship", "event", "news"],
+  "keywords": list of strings for searching in title, content, tags,
+  "categories": list of category strings,
+  "time_filter": "today" | "this week" | "this month" | null,
+  "location_type": "nearby" | null
+}}
+"""
+
+        response = ollama.chat(
+            model="qwen2:0.5b",
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            options={"temperature": 0.2}
+        )
+
+        extracted = response["message"]["content"]
+        params = json.loads(extracted)
+
+        # --- Step 2. Build Firestore Query ---
+        query = db.collection("institution_posts")
+
+        # Filter by categories
+        if params.get("categories"):
+            query = query.where("categories", "array_contains_any", params["categories"])
+
+        # Filter by post types (maps to type_of_post)
+        if params.get("post_types"):
+            query = query.where("type_of_post", "in", params["post_types"])
+
+        # Apply time filters
+        if params.get("time_filter"):
+            now = datetime.now()
+            tf = params["time_filter"].lower()
+            if tf == "today":
+                start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            elif tf == "this week":
+                start_time = now - timedelta(days=now.weekday())
+                start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            elif tf == "this month":
+                start_time = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            else:
+                start_time = None
+
+            if start_time:
+                query = query.where("created_at", ">=", start_time)
+
+        # --- Step 3. Fetch initial results ---
+        posts = []
+        for doc in query.stream():
+            post_model = convert_doc_to_model(doc.id, doc.to_dict(), InstitutionPostInDB)
+            posts.append(post_model)
+
+        # --- Step 4. Keyword filtering (manual, since Firestore doesn't support full-text search) ---
+        keywords = params.get("keywords", [])
+        if keywords:
+            posts = [
+                post for post in posts
+                if any(
+                    kw.lower() in (post.title or "").lower() or
+                    kw.lower() in (post.content or "").lower() or
+                    kw.lower() in " ".join(post.tags or []).lower()
+                    for kw in keywords
+                )
+            ]
+
+        # --- Step 5. Nearby filtering ---
+        if params.get("location_type") == "nearby" and lat and lon:
+            posts = [post for post in posts if hasattr(post, "map_location")]
+            for post in posts:
+                if post.map_location:
+                    post.distance = haversine_distance(
+                        lat, lon,
+                        post.map_location.lat,
+                        post.map_location.lng
+                    )
+            posts.sort(key=lambda x: getattr(x, "distance", float("inf")))
+            posts = [p for p in posts if getattr(p, "distance", float("inf")) <= radius]
+
+        return posts[:50]
+
+    except Exception as e:
+        logger.error(f"AI search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"AI search failed: {e}")
 
 @router.post("/", response_model=InstitutionPostInDB, status_code=status.HTTP_201_CREATED)
 async def create_institution_post(post: InstitutionPostCreate, current_user_id: str = Depends(get_current_user_id)):
@@ -112,14 +216,12 @@ async def get_all_institution_posts(
 async def get_nearby_institution_posts(lat: float, lon: float, radius: int = 500):
     if db is None:
         raise HTTPException(status_code=500, detail="Firestore not initialized.")
-    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-        raise HTTPException(status_code=400, detail="Invalid coordinates")
 
     try:
+        # Calculate bounding box for geohash
         min_lat, min_lon, max_lat, max_lon = bounding_box(lat, lon, radius)
-
-        geohash_sw = geohash2.encode(min_lat, min_lon, precision=5)
-        geohash_ne = geohash2.encode(max_lat, max_lon, precision=5)
+        geohash_sw = geohash2.encode(min_lat, min_lon, precision=7)  # Adjusted precision for better performance
+        geohash_ne = geohash2.encode(max_lat, max_lon, precision=7)
 
         query = db.collection("institution_posts") \
                   .where("geohash", ">=", geohash_sw) \
@@ -150,7 +252,7 @@ async def get_institution_post(post_id: str):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         post_ref = db.collection("institution_posts").document(post_id)
-        doc = post_ref.get()  # removed await
+        doc = post_ref.get()
         if not doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution post not found")
         return convert_doc_to_model(doc.id, doc.to_dict(), InstitutionPostInDB)
@@ -164,7 +266,7 @@ async def update_institution_post(post_id: str, post: InstitutionPostUpdate, cur
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         post_ref = db.collection("institution_posts").document(post_id)
-        existing_doc = post_ref.get()  # removed await
+        existing_doc = post_ref.get()
 
         if not existing_doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution post not found")
@@ -177,8 +279,8 @@ async def update_institution_post(post_id: str, post: InstitutionPostUpdate, cur
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to update this post.")
 
         update_data = post.model_dump(exclude_unset=True, by_alias=True)
-        post_ref.update(update_data)  # removed await
-        updated_doc = post_ref.get()  # removed await
+        post_ref.update(update_data)
+        updated_doc = post_ref.get()
         return convert_doc_to_model(updated_doc.id, updated_doc.to_dict(), InstitutionPostInDB)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to update institution post: {e}")
@@ -190,7 +292,7 @@ async def delete_institution_post(post_id: str, current_user_id: str = Depends(g
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Firestore not initialized.")
     try:
         post_ref = db.collection("institution_posts").document(post_id)
-        existing_doc = post_ref.get()  # removed await
+        existing_doc = post_ref.get()
 
         if not existing_doc.exists:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution post not found")
@@ -202,9 +304,7 @@ async def delete_institution_post(post_id: str, current_user_id: str = Depends(g
         if not institution_doc.exists or institution_doc.to_dict().get('owner_id') != current_user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to delete this post.")
 
-        post_ref.delete()  # removed await
+        post_ref.delete()
         return {"message": "Institution post deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to delete institution post: {e}")
-
-
