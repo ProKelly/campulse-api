@@ -10,7 +10,7 @@ from google.cloud.firestore_v1 import SERVER_TIMESTAMP
 import logging
 import geohash2
 import ollama  # New import for Ollama
-import json
+import json, requests
 
 router = APIRouter(prefix="/institution_posts", tags=["Institution Posts"])
 logger = logging.getLogger(__name__)
@@ -31,7 +31,6 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
     return R * c
 
-
 @router.get("/ai-search", response_model=List[InstitutionPostInDB])
 async def ai_search_posts(
     search_query: str,
@@ -43,43 +42,55 @@ async def ai_search_posts(
         raise HTTPException(status_code=500, detail="Firestore not initialized.")
 
     try:
-        # --- Step 1. Use Ollama to extract search params ---
+        # --- Step 1. Use remote Ollama daemon to extract search params ---
         prompt = f"""Analyze the user's natural language search query and extract parameters for filtering posts.
 
 Query: {search_query}
 
 Output ONLY the JSON object, nothing else:
 {{
-  "post_types": list of strings like ["job", "internship", "event", "news"],
-  "keywords": list of strings for searching in title, content, tags,
-  "categories": list of category strings,
-  "time_filter": "today" | "this week" | "this month" | null,
-  "location_type": "nearby" | null
+  "post_types": ["job", "internship", "event", "news"],
+  "keywords": [],
+  "categories": [],
+  "time_filter": null,
+  "location_type": null
 }}
 """
 
-        response = ollama.chat(
-            model="qwen2:0.5b",
-            messages=[{"role": "user", "content": prompt}],
-            format="json",
-            options={"temperature": 0.2}
-        )
+        # Call the exposed Ollama daemon
+        OLLAMA_URL = "https://api.dsmartcity.site/ollama"
+        payload = {
+            "model": "qwen2:0.5b",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2
+        }
 
-        extracted = response["message"]["content"]
-        params = json.loads(extracted)
+        headers = {"Content-Type": "application/json"}
+        resp = requests.post(OLLAMA_URL, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Safely extract JSON from Ollama response
+        if "message" not in data or "content" not in data["message"]:
+            raise HTTPException(status_code=500, detail="Invalid response from Ollama API")
+
+        extracted = data["message"]["content"]
+
+        # Strip any extra text and parse JSON
+        start = extracted.find("{")
+        end = extracted.rfind("}") + 1
+        if start == -1 or end == -1:
+            raise HTTPException(status_code=500, detail="Failed to parse JSON from Ollama")
+        params = json.loads(extracted[start:end])
 
         # --- Step 2. Build Firestore Query ---
         query = db.collection("institution_posts")
 
-        # Filter by categories
         if params.get("categories"):
             query = query.where("categories", "array_contains_any", params["categories"])
-
-        # Filter by post types (maps to type_of_post)
         if params.get("post_types"):
             query = query.where("type_of_post", "in", params["post_types"])
 
-        # Apply time filters
         if params.get("time_filter"):
             now = datetime.now()
             tf = params["time_filter"].lower()
@@ -92,25 +103,21 @@ Output ONLY the JSON object, nothing else:
                 start_time = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             else:
                 start_time = None
-
             if start_time:
                 query = query.where("created_at", ">=", start_time)
 
         # --- Step 3. Fetch initial results ---
-        posts = []
-        for doc in query.stream():
-            post_model = convert_doc_to_model(doc.id, doc.to_dict(), InstitutionPostInDB)
-            posts.append(post_model)
+        posts = [convert_doc_to_model(doc.id, doc.to_dict(), InstitutionPostInDB) for doc in query.stream()]
 
-        # --- Step 4. Keyword filtering (manual, since Firestore doesn't support full-text search) ---
+        # --- Step 4. Keyword filtering ---
         keywords = params.get("keywords", [])
         if keywords:
             posts = [
                 post for post in posts
                 if any(
-                    kw.lower() in (post.title or "").lower() or
-                    kw.lower() in (post.content or "").lower() or
-                    kw.lower() in " ".join(post.tags or []).lower()
+                    kw.lower() in (post.title or "").lower()
+                    or kw.lower() in (post.content or "").lower()
+                    or kw.lower() in " ".join(post.tags or []).lower()
                     for kw in keywords
                 )
             ]
@@ -133,6 +140,7 @@ Output ONLY the JSON object, nothing else:
     except Exception as e:
         logger.error(f"AI search failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI search failed: {e}")
+
 
 @router.post("/", response_model=InstitutionPostInDB, status_code=status.HTTP_201_CREATED)
 async def create_institution_post(post: InstitutionPostCreate, current_user_id: str = Depends(get_current_user_id)):
